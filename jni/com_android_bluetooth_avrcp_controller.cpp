@@ -28,6 +28,7 @@
 namespace android {
 static jmethodID method_handlePassthroughRsp;
 static jmethodID method_onConnectionStateChanged;
+static jmethodID method_onGetElementAttrRsp;
 
 static const btrc_ctrl_interface_t *sBluetoothAvrcpInterface = NULL;
 static jobject mCallbacksObj = NULL;
@@ -84,11 +85,54 @@ static void btavrcp_connection_state_callback(bool state, bt_bdaddr_t* bd_addr) 
     sCallbackEnv->DeleteLocalRef(addr);
 }
 
+static void btavrcp_get_element_attr_response_callback(uint8_t num_attr, btrc_element_attr_val_t *p_attrs){
+    int i;
+    jint attrs_temp[num_attr];
+    jintArray attrs;
+    jobjectArray values;
+
+    ALOGI("%s", __FUNCTION__);
+    ALOGI("num_attr: %d", num_attr);
+
+    if (!checkCallbackThread()) {                                       \
+        ALOGE("Callback: '%s' is not called on the correct thread", __FUNCTION__); \
+        return;                                                         \
+    }
+
+    attrs = (jintArray)sCallbackEnv->NewIntArray(num_attr);
+    if (!attrs) {
+        ALOGE("Fail to new jintArray for attrs");
+        checkAndClearExceptionFromCallback(sCallbackEnv, __FUNCTION__);
+        return;
+    }
+
+    values = (jobjectArray)sCallbackEnv->NewObjectArray(num_attr,
+             sCallbackEnv->FindClass("java/lang/String"),
+             NULL);
+    if (!values) {
+        ALOGE("Fail to new jobjectArray for values");
+        checkAndClearExceptionFromCallback(sCallbackEnv, __FUNCTION__);
+        return;
+    }
+
+    for (i=0; i<num_attr; i++){
+        attrs_temp[i] = p_attrs[i].attr_id;
+        sCallbackEnv->SetObjectArrayElement(values, i, sCallbackEnv->NewStringUTF((char *)p_attrs[i].text));
+    }
+    sCallbackEnv->SetIntArrayRegion(attrs, 0, num_attr, attrs_temp);
+
+    sCallbackEnv->CallVoidMethod(mCallbacksObj, method_onGetElementAttrRsp, (jint) num_attr,
+                                     attrs, values);
+    checkAndClearExceptionFromCallback(sCallbackEnv, __FUNCTION__);
+    sCallbackEnv->DeleteLocalRef(attrs);
+    sCallbackEnv->DeleteLocalRef(values);
+}
 
 static btrc_ctrl_callbacks_t sBluetoothAvrcpCallbacks = {
     sizeof(sBluetoothAvrcpCallbacks),
     btavrcp_passthrough_response_callback,
-    btavrcp_connection_state_callback
+    btavrcp_connection_state_callback,
+    btavrcp_get_element_attr_response_callback
 };
 
 static void classInitNative(JNIEnv* env, jclass clazz) {
@@ -97,6 +141,9 @@ static void classInitNative(JNIEnv* env, jclass clazz) {
 
     method_onConnectionStateChanged =
         env->GetMethodID(clazz, "onConnectionStateChanged", "(Z[B)V");
+
+    method_onGetElementAttrRsp =
+        env->GetMethodID(clazz, "onGetElementAttrRsp", "(I[I[Ljava/lang/String;)V");
 
     ALOGI("%s: succeeds", __FUNCTION__);
 }
@@ -183,12 +230,50 @@ static jboolean sendPassThroughCommandNative(JNIEnv *env, jobject object, jbyteA
     return (status == BT_STATUS_SUCCESS) ? JNI_TRUE : JNI_FALSE;
 }
 
+static jboolean getElementAttrNative(JNIEnv *env, jobject object, jbyteArray address,
+                                                    jint numAttr, jintArray attrs) {
+    jbyte *addr;
+    int32_t *attrsElements;
+    bt_status_t status;
+
+    if (!sBluetoothAvrcpInterface) return JNI_FALSE;
+
+    if (numAttr > BTRC_MAX_ELEM_ATTR_SIZE) {
+        ALOGE("getElementAttrNative: number of attributes exceed maximum");
+        return JNI_FALSE;
+    }
+
+    addr = env->GetByteArrayElements(address, NULL);
+    if (!addr) {
+        jniThrowIOException(env, EINVAL);
+        return JNI_FALSE;
+    }
+
+    attrsElements = env->GetIntArrayElements(attrs, NULL);
+    if (!attrsElements) {
+        jniThrowIOException(env, EINVAL);
+        return JNI_FALSE;
+    }
+
+    if ((status = sBluetoothAvrcpInterface->get_element_attr((bt_bdaddr_t *)addr,
+                numAttr, (btrc_media_attr_t *)attrsElements)) !=
+        BT_STATUS_SUCCESS) {
+        ALOGE("Failed getElementAttrNative, status: %d", status);
+    }
+
+    env->ReleaseByteArrayElements(address, addr, 0);
+    env->ReleaseIntArrayElements(attrs, attrsElements, 0);
+    return (status == BT_STATUS_SUCCESS) ? JNI_TRUE : JNI_FALSE;
+}
+
 static JNINativeMethod sMethods[] = {
     {"classInitNative", "()V", (void *) classInitNative},
     {"initNative", "()V", (void *) initNative},
     {"cleanupNative", "()V", (void *) cleanupNative},
     {"sendPassThroughCommandNative", "([BII)Z",
      (void *) sendPassThroughCommandNative},
+    {"getElementAttrNative", "([BI[I)Z",
+     (void *) getElementAttrNative},
 };
 
 int register_com_android_bluetooth_avrcp_controller(JNIEnv* env)

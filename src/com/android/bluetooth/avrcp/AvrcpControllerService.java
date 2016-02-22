@@ -21,11 +21,14 @@ import android.bluetooth.BluetoothAvrcpController;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothProfile;
 import android.bluetooth.IBluetoothAvrcpController;
+import android.bluetooth.IBluetoothAvrcpControllerCallback;
 import android.content.Intent;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.Message;
+import android.os.RemoteException;
 import android.util.Log;
 
 import com.android.bluetooth.btservice.ProfileService;
@@ -43,13 +46,22 @@ public class AvrcpControllerService extends ProfileService {
     private static final boolean DBG = false;
     private static final String TAG = "AvrcpControllerService";
 
+    private static final String KEY_ATTRS = "KEY_ATTRS";
+    private static final String KEY_NUM_ATTR = "KEY_NUM_ATTR";
+    private static final String KEY_VALUES = "KEY_VALUES";
+    private static final String KEY_DEVICE = "KEY_DEVICE";
+
     private static final int MESSAGE_SEND_PASS_THROUGH_CMD = 1;
+    private static final int MESSAGE_GET_ELEMENT_ATTR = 2;
+    private static final int MESSAGE_GET_ELEMENT_ATTR_RSP = 3;
 
     private AvrcpMessageHandler mHandler;
     private static AvrcpControllerService sAvrcpControllerService;
 
     private final ArrayList<BluetoothDevice> mConnectedDevices
             = new ArrayList<BluetoothDevice>();
+
+    private IBluetoothAvrcpControllerCallback mCallback;
 
     static {
         classInitNative();
@@ -165,6 +177,33 @@ public class AvrcpControllerService extends ProfileService {
         mHandler.sendMessage(msg);
     }
 
+    public void getElementAttr(BluetoothDevice device, int numAttr, int[] attrs) {
+        if (DBG) Log.d(TAG, "getElementAttr");
+        Log.v(TAG, "attrs: " + attrs);
+        if (device == null) {
+            throw new NullPointerException("device == null");
+        }
+        enforceCallingOrSelfPermission(BLUETOOTH_PERM, "Need BLUETOOTH permission");
+        Bundle bundle = new Bundle();
+        bundle.putInt(KEY_NUM_ATTR, numAttr);
+        bundle.putIntArray(KEY_ATTRS, attrs);
+        bundle.putParcelable(KEY_DEVICE, device);
+        Message msg = mHandler.obtainMessage(MESSAGE_GET_ELEMENT_ATTR, bundle);
+        mHandler.sendMessage(msg);
+    }
+
+    public void setCallback(IBluetoothAvrcpControllerCallback callback){
+        synchronized (this) {
+            mCallback = callback;
+        }
+    }
+
+    public void removeCallback(){
+        synchronized (this) {
+            mCallback = null;
+        }
+    }
+
     //Binder object: Must be static class or memory leak may occur
     private static class BluetoothAvrcpControllerBinder extends IBluetoothAvrcpController.Stub
         implements IProfileServiceBinder {
@@ -215,6 +254,24 @@ public class AvrcpControllerService extends ProfileService {
             if (service == null) return;
             service.sendPassThroughCmd(device, keyCode, keyState);
         }
+
+        public void getElementAttr(BluetoothDevice device, int numAttr, int[] attrs) {
+            AvrcpControllerService service = getService();
+            if (service == null) return;
+            service.getElementAttr(device, numAttr, attrs);
+        }
+
+        public void setCallback(IBluetoothAvrcpControllerCallback callback) {
+            AvrcpControllerService service = getService();
+            if (service == null) return;
+            service.setCallback(callback);
+        }
+
+        public void removeCallback() {
+            AvrcpControllerService service = getService();
+            if (service == null) return;
+            service.removeCallback();
+        }
     };
 
     /** Handles Avrcp messages. */
@@ -226,11 +283,40 @@ public class AvrcpControllerService extends ProfileService {
         @Override
         public void handleMessage(Message msg) {
             switch (msg.what) {
-            case MESSAGE_SEND_PASS_THROUGH_CMD:
-                if (DBG) Log.v(TAG, "MESSAGE_SEND_PASS_THROUGH_CMD");
-                BluetoothDevice device = (BluetoothDevice)msg.obj;
-                sendPassThroughCommandNative(getByteAddress(device), msg.arg1, msg.arg2);
-                break;
+                case MESSAGE_SEND_PASS_THROUGH_CMD: {
+                    if (DBG) Log.v(TAG, "MESSAGE_SEND_PASS_THROUGH_CMD");
+                    BluetoothDevice device = (BluetoothDevice) msg.obj;
+                    sendPassThroughCommandNative(getByteAddress(device), msg.arg1, msg.arg2);
+                    break;
+                }
+
+                case MESSAGE_GET_ELEMENT_ATTR: {
+                    if (DBG) Log.v(TAG, "MESSAGE_GET_ELEMENT_ATTR");
+                    Bundle bundle = (Bundle) msg.obj;
+                    BluetoothDevice device = (BluetoothDevice) bundle.getParcelable(KEY_DEVICE);
+                    int numAttr = bundle.getInt(KEY_NUM_ATTR);
+                    int[] attrs = bundle.getIntArray(KEY_ATTRS);
+                    getElementAttrNative(getByteAddress(device), numAttr, attrs);
+                    break;
+                }
+
+                case MESSAGE_GET_ELEMENT_ATTR_RSP: {
+                    if (DBG) Log.v(TAG, "MESSAGE_GET_ELEMENT_ATTR_RSP");
+                    Bundle bundle = (Bundle) msg.obj;
+                    int numAttr = bundle.getInt(KEY_NUM_ATTR);
+                    int[] attrs = bundle.getIntArray(KEY_ATTRS);
+                    String[] values = bundle.getStringArray(KEY_VALUES);
+                    synchronized (AvrcpControllerService.this) {
+                        if (mCallback != null)
+                            try {
+                                mCallback.onGetElementAttrRsp(numAttr, attrs, values);
+                            } catch (RemoteException e) {
+                                Log.d(TAG, "Error invoking onGetElementAttrRsp callback");
+                                e.printStackTrace();
+                            }
+                    }
+                    break;
+                }
             }
         }
     }
@@ -258,7 +344,18 @@ public class AvrcpControllerService extends ProfileService {
 
     private void handlePassthroughRsp(int id, int keyState) {
         Log.d(TAG, "passthrough response received as: key: "
-                                + id + " state: " + keyState);
+                + id + " state: " + keyState);
+    }
+
+    private void onGetElementAttrRsp(int numAttr, int[] attrs, String[] values) {
+        Log.d(TAG, "onGetElementAttrRsp numAttr:" + numAttr);
+
+        Bundle bundle = new Bundle();
+        bundle.putInt(KEY_NUM_ATTR, numAttr);
+        bundle.putIntArray(KEY_ATTRS, attrs);
+        bundle.putStringArray(KEY_VALUES, values);
+        Message msg = mHandler.obtainMessage(MESSAGE_GET_ELEMENT_ATTR_RSP, bundle);
+        mHandler.sendMessage(msg);
     }
 
     private byte[] getByteAddress(BluetoothDevice device) {
@@ -274,4 +371,5 @@ public class AvrcpControllerService extends ProfileService {
     private native void initNative();
     private native void cleanupNative();
     private native boolean sendPassThroughCommandNative(byte[] address, int keyCode, int keyState);
+    private native boolean getElementAttrNative(byte[] address, int numAttr, int[] attrs);
 }
